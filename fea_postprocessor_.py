@@ -622,6 +622,80 @@ def rst_to_viewer_dataframes(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# § 4  SYNTHETIC DEMO DATA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_synthetic_fea_data(
+    nx: int = 8,
+    ny: int = 5,
+    nz: int = 4,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Build a structured Hex8 brick mesh with two analytical scalar fields.
+    Used as the demo dataset on startup and via File → Load Demo.
+
+    Returns
+    -------
+    nodes_df    : [Node_ID, X, Y, Z]
+    elements_df : [Element_ID, N1…N8]
+    results_df  : [Node_ID, Von_Mises_Stress, Temperature]
+    """
+    px = np.linspace(0.0, 100.0, nx + 1)
+    py = np.linspace(0.0,  60.0, ny + 1)
+    pz = np.linspace(0.0,  40.0, nz + 1)
+
+    node_ids, xs, ys, zs = [], [], [], []
+    node_index: dict = {}
+    nid = 0
+    for iz in range(nz + 1):
+        for iy in range(ny + 1):
+            for ix in range(nx + 1):
+                node_index[(ix, iy, iz)] = nid
+                node_ids.append(nid + 1)
+                xs.append(px[ix])
+                ys.append(py[iy])
+                zs.append(pz[iz])
+                nid += 1
+
+    nodes_df = pd.DataFrame(
+        {'Node_ID': node_ids, 'X': xs, 'Y': ys, 'Z': zs})
+
+    elem_ids, connectivity = [], []
+    eid = 1
+    for iz in range(nz):
+        for iy in range(ny):
+            for ix in range(nx):
+                def n(dx, dy, dz):
+                    return node_index[(ix+dx, iy+dy, iz+dz)] + 1
+                connectivity.append([
+                    n(0,0,0), n(1,0,0), n(1,1,0), n(0,1,0),
+                    n(0,0,1), n(1,0,1), n(1,1,1), n(0,1,1),
+                ])
+                elem_ids.append(eid)
+                eid += 1
+
+    elements_df = pd.DataFrame(
+        connectivity, columns=[f'N{j+1}' for j in range(8)])
+    elements_df.insert(0, 'Element_ID', elem_ids)
+
+    x_arr = nodes_df['X'].values
+    y_arr = nodes_df['Y'].values
+    z_arr = nodes_df['Z'].values
+    cx, cy, cz = 100.0, 30.0, 20.0
+    dist = np.sqrt((x_arr-cx)**2 + (y_arr-cy)**2 + (z_arr-cz)**2)
+    rng  = np.random.default_rng(42)
+    vm   = 450.0 * np.exp(-dist / 55.0) + 50.0 * rng.random(len(x_arr))
+    temp = 20.0 + 1.8 * x_arr + 12.0 * np.sin(np.pi * z_arr / 40.0)
+
+    results_df = pd.DataFrame({
+        'Node_ID':          nodes_df['Node_ID'],
+        'Von_Mises_Stress': vm.round(4),
+        'Temperature':      temp.round(4),
+    })
+    return nodes_df, elements_df, results_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # § 5  VTK UNSTRUCTURED GRID BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1700,18 +1774,20 @@ class FEAPostProcessor:
         self._configure_root()
         self._bind_shortcuts()
 
-        # ── Data layer — starts blank; user loads via Import or Assign Sheets ──
-        self.nodes_df    = pd.DataFrame(columns=['Node_ID', 'X', 'Y', 'Z'])
-        self.elements_df = pd.DataFrame(
-            columns=['Element_ID', 'N1', 'N2', 'N3', 'N4',
-                     'N5', 'N6', 'N7', 'N8'])
-        self.results_df  = pd.DataFrame(columns=['Node_ID'])
-        self._scalar_cols: list = []
-        self._source_label: str = 'No data loaded'
-        self.grid = None          # UnstructuredGrid built only after data is assigned
+        # ── Data layer ────────────────────────────────────────────────────────
+        self.nodes_df, self.elements_df, self.results_df = \
+            generate_synthetic_fea_data()
+        self._scalar_cols: list  = ['Von_Mises_Stress', 'Temperature']
+        self._source_label: str  = 'Synthetic (demo)'
+
+        # ── VTK grid ──────────────────────────────────────────────────────────
+        if VTK_AVAILABLE:
+            self.grid = build_vtk_unstructured_grid(
+                self.nodes_df, self.elements_df,
+                self.results_df, self._scalar_cols)
 
         # ── Tk state vars ─────────────────────────────────────────────────────
-        self.active_result   = tk.StringVar(value='')
+        self.active_result   = tk.StringVar(value=self._scalar_cols[0])
         self.colorbar_min    = tk.DoubleVar()
         self.colorbar_max    = tk.DoubleVar()
         self._show_edges_var = tk.BooleanVar(value=False)
@@ -1732,7 +1808,7 @@ class FEAPostProcessor:
 
         if VTK_AVAILABLE:
             self._init_vtk_renderer()
-            self._show_empty_viewport()   # blank — no mesh until user loads data
+            self._render_mesh()
         else:
             self._show_vtk_fallback()
 
@@ -1806,6 +1882,8 @@ class FEAPostProcessor:
             label='⚙  Import ANSYS File…  (Ctrl+O)',
             command=self._cmd_import_ansys)
         fm.add_separator()
+        fm.add_command(label='Load Synthetic Demo Data',
+                       command=self._cmd_load_demo)
         fm.add_command(label='Clear Session  (Ctrl+W)',
                        command=self._cmd_clear_session)
         fm.add_separator()
@@ -2368,50 +2446,6 @@ class FEAPostProcessor:
             font=('Consolas', 11),
             justify='center').place(relx=0.5, rely=0.5, anchor='center')
 
-    def _show_empty_viewport(self) -> None:
-        """
-        Paint a 'no data' welcome message inside the VTK canvas.
-        Called on startup and after Clear Session.
-        The VTK renderer exists but has no actors — background only.
-        """
-        if VTK_AVAILABLE and hasattr(self, '_render_window'):
-            self._render_window.Render()   # draw clean dark background
-
-        # Overlay a Tk label on top of the canvas as a prompt
-        if hasattr(self, '_vtk_canvas'):
-            # Remove any previous overlay
-            for w in self._vtk_canvas.winfo_children():
-                w.destroy()
-            prompt = tk.Frame(self._vtk_canvas, bg='#181c22',
-                              padx=30, pady=20)
-            prompt.place(relx=0.5, rely=0.5, anchor='center')
-            tk.Label(prompt,
-                text='⬡  No mesh loaded',
-                bg='#181c22', fg=self.ACCENT,
-                font=('Segoe UI', 16, 'bold')).pack(pady=(0, 8))
-            tk.Label(prompt,
-                text='Import an ANSYS file  or  assign sheet roles\n'
-                     'to load geometry and results into the viewer.',
-                bg='#181c22', fg=self.FG_MUTED,
-                font=('Segoe UI', 10),
-                justify='center').pack(pady=(0, 16))
-            tk.Button(prompt,
-                text='⚙  Import ANSYS File…  (Ctrl+O)',
-                command=self._cmd_import_ansys,
-                bg=self.ACCENT, fg=self.BG_DARK,
-                font=('Segoe UI', 10, 'bold'),
-                relief='flat', padx=16, pady=8,
-                cursor='hand2').pack(fill='x', pady=3)
-            tk.Button(prompt,
-                text='⊞  Assign Sheet Roles…',
-                command=self._cmd_assign_sheets,
-                bg=self.BG_LIGHT, fg=self.FG_TEXT,
-                font=('Segoe UI', 10),
-                relief='flat', padx=16, pady=8,
-                cursor='hand2').pack(fill='x', pady=3)
-        self._toolbar_scalar_var.set('')
-        self._set_status('Ready — import a file or assign sheet roles to begin.')
-
     # ── Render loop ───────────────────────────────────────────────────────────
 
     def _render_mesh(self) -> None:
@@ -2421,11 +2455,6 @@ class FEAPostProcessor:
         across colorbar updates, result-field switches, and file reloads.
         """
         if not VTK_AVAILABLE:
-            return
-
-        # No data loaded yet — show the welcome prompt instead of rendering
-        if self.grid is None:
-            self._show_empty_viewport()
             return
 
         camera_state = (self._capture_camera()
@@ -2777,15 +2806,14 @@ class FEAPostProcessor:
         ANSYSImportDialog(self.root, self)
 
     def _cmd_reset_camera(self) -> None:
-        if VTK_AVAILABLE and self._actor and self.grid is not None:
+        if VTK_AVAILABLE and self._actor:
             self._renderer.ResetCamera()
             self._render_window.Render()
             self._set_status('Camera reset to fit mesh.')
 
     def _cmd_toggle_edges(self) -> None:
         self._show_edges_var.set(not self._show_edges_var.get())
-        if self.grid is not None:
-            self._render_mesh()
+        self._render_mesh()
 
     def _cmd_toggle_axes(self) -> None:
         self._show_axes_var.set(not self._show_axes_var.get())
@@ -2802,47 +2830,42 @@ class FEAPostProcessor:
 
     def _cmd_clear_session(self) -> None:
         """
-        Wipe ALL imported data, null out the VTK grid, clear every actor,
-        reset the data grid to empty sheets, and show the welcome prompt.
+        Wipe all imported data and return the application to a blank state.
+        The 3D viewport is cleared, the data grid tabs are reset to empty
+        frames, and all sidebar controls are reset to defaults.
         """
         if not messagebox.askyesno(
                 'Clear Session',
-                'Remove all loaded data and return to an empty session?\n\n'
-                'You can then import a new file or assign sheet roles.',
+                'Remove all imported data and reset to a blank session?\n\n'
+                'The synthetic demo data will NOT be reloaded.\n'
+                'Use File → Load Synthetic Demo Data to restore it.',
                 icon='warning', parent=self.root):
             return
 
-        # ── 1. Stop picking / probe ───────────────────────────────────────────
+        # ── 1. Stop any pending highlight / probe state ───────────────────────
         self._picking_var.set(False)
         self._write_probe('Awaiting selection…')
         self._coord_var.set('')
 
-        # ── 2. Remove every VTK actor and null the grid ───────────────────────
-        if VTK_AVAILABLE and hasattr(self, '_renderer'):
+        # ── 2. Clear VTK actors ───────────────────────────────────────────────
+        if VTK_AVAILABLE:
             for attr in ('_actor', '_scalar_bar', '_highlight_actor'):
                 a = getattr(self, attr, None)
                 if a is not None:
                     self._renderer.RemoveActor(a)
                     setattr(self, attr, None)
-            self._renderer.RemoveAllViewProps()   # belt-and-braces
-            # Re-enable the axes orientation widget (removed by RemoveAllViewProps)
-            if hasattr(self, '_axes_widget'):
-                self._axes_widget.SetEnabled(
-                    1 if self._show_axes_var.get() else 0)
             self._render_window.Render()
 
-        self.grid = None   # ← critical: prevents _render_mesh from using old data
-
-        # ── 3. Reset all DataFrames ───────────────────────────────────────────
-        self.nodes_df    = pd.DataFrame(columns=['Node_ID', 'X', 'Y', 'Z'])
+        # ── 3. Reset data layer to minimal empty DataFrames ───────────────────
+        self.nodes_df = pd.DataFrame(columns=['Node_ID', 'X', 'Y', 'Z'])
         self.elements_df = pd.DataFrame(
             columns=['Element_ID', 'N1', 'N2', 'N3', 'N4',
                      'N5', 'N6', 'N7', 'N8'])
         self.results_df  = pd.DataFrame(columns=['Node_ID'])
         self._scalar_cols  = []
-        self._source_label = 'No data loaded'
+        self._source_label = 'Empty session'
 
-        # ── 4. Destroy all dynamic tabs ───────────────────────────────────────
+        # ── 4. Remove all dynamically-added tabs from the right panel ─────────
         for name in list(self._imported_tabs.keys()):
             if name in self._sheet_frames:
                 self._sheet_frames[name].pack_forget()
@@ -2853,25 +2876,21 @@ class FEAPostProcessor:
                 del self._tab_buttons[name]
         self._imported_tabs.clear()
 
-        # ── 5. Refresh built-in sheets with empty frames ──────────────────────
+        # ── 5. Refresh the three built-in sheets with empty DataFrames ────────
         for name, df in [('Nodes',    self.nodes_df),
                           ('Elements', self.elements_df),
                           ('Results',  self.results_df)]:
             self._populate_sheet_frame(self._sheet_frames[name], df)
         self._switch_grid_tab('Nodes')
 
-        # ── 6. Reset sidebar ──────────────────────────────────────────────────
+        # ── 6. Reset sidebar controls ─────────────────────────────────────────
         self.active_result.set('')
         self._result_cb.configure(values=[])
         self.colorbar_min.set(0.0)
         self.colorbar_max.set(1.0)
         self._refresh_stats_card()
-        self._source_lbl_var.set('No data loaded')
-
-        # ── 7. Show the welcome/import prompt in the 3D viewport ─────────────
-        self._show_empty_viewport()
-        self._set_status(
-            'Session cleared — import a file or assign sheet roles to load data.')
+        self._source_lbl_var.set('Empty session — import a file to begin')
+        self._set_status('Session cleared.  Use File → Import ANSYS File to load data.')
 
     def _cmd_assign_sheets(self) -> None:
         """
@@ -2944,6 +2963,39 @@ class FEAPostProcessor:
 
         self._set_status(
             f'Sheet roles assigned — rendered from: {source_label}')
+
+    def _cmd_load_demo(self) -> None:
+        """Reload the synthetic Hex8 demo dataset and re-render."""
+        if not messagebox.askyesno('Load Demo',
+                                   'Reload the synthetic demo dataset?\n'
+                                   'All imported ANSYS data will be replaced.'):
+            return
+        self.nodes_df, self.elements_df, self.results_df = \
+            generate_synthetic_fea_data()
+        self._scalar_cols  = ['Von_Mises_Stress', 'Temperature']
+        self._source_label = 'Synthetic (demo)'
+
+        if VTK_AVAILABLE:
+            self.grid = build_vtk_unstructured_grid(
+                self.nodes_df, self.elements_df,
+                self.results_df, self._scalar_cols)
+
+        self.active_result.set(self._scalar_cols[0])
+        self._result_cb.configure(values=self._scalar_cols)
+        self._update_scalar_range_vars()
+
+        for name, df in [('Nodes',    self.nodes_df),
+                          ('Elements', self.elements_df),
+                          ('Results',  self.results_df)]:
+            self._populate_sheet_frame(self._sheet_frames[name], df)
+
+        self._refresh_stats_card()
+        self._source_lbl_var.set('Synthetic (demo)')
+
+        if VTK_AVAILABLE:
+            self._actor = None   # force camera reset
+            self._render_mesh()
+        self._set_status('Synthetic demo dataset loaded.')
 
     def _cmd_about(self) -> None:
         ansys_ok = ('✔  ansys-mapdl-reader installed'
