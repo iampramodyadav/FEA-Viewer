@@ -771,6 +771,500 @@ def build_vtk_unstructured_grid(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# § 6a  SHEET ROLE ASSIGNMENT DIALOG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SheetRoleDialog:
+    """
+    Modal dialog that lets the user assign which imported tab plays which
+    viewer role (Nodes / Elements / Results), and — for the Elements tab —
+    pick the exact column range that contains node connectivity indices.
+
+    After the user clicks "Apply & Render", the dialog calls:
+        app._on_sheet_roles_assigned(nodes_tab, node_id_col,
+                                     elem_tab,  node_col_first, node_col_last,
+                                     result_tab, scalar_cols)
+    """
+
+    # Colour aliases (kept local so the dialog has no coupling to app palette)
+    _BG       = '#1a1d23'
+    _BG_MED   = '#252b34'
+    _BG_LIGHT = '#2d3440'
+    _ACCENT   = '#4fc3f7'
+    _FG       = '#e8eaf0'
+    _MUTED    = '#8892a4'
+    _GREEN    = '#69f0ae'
+    _RED      = '#ef5350'
+    _BORDER   = '#3d4554'
+
+    def __init__(self, master: tk.Tk, app: 'FEAPostProcessor') -> None:
+        self.master = master
+        self.app    = app
+
+        # Gather all tab names that have DataFrames attached
+        self._tabs: dict[str, 'pd.DataFrame'] = {}
+        for name in ('Nodes', 'Elements', 'Results'):
+            self._tabs[name] = app._get_tab_df(name)
+        for name, df in app._imported_tabs.items():
+            self._tabs[name] = df
+
+        self.win = tk.Toplevel(master)
+        self.win.title('⊞  Assign Sheet Roles')
+        self.win.geometry('780x620')
+        self.win.minsize(680, 500)
+        self.win.grab_set()
+        self.win.configure(bg=self._BG)
+        self._build()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        tab_names = list(self._tabs.keys())
+        NONE_OPT  = '— none —'
+        opts      = [NONE_OPT] + tab_names
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(self.win, bg='#1565C0')
+        hdr.pack(fill='x')
+        tk.Label(hdr,
+            text='  ⊞  Assign Sheet Roles  —  Map imported tabs to viewer layers',
+            font=('Segoe UI', 10, 'bold'),
+            bg='#1565C0', fg='white', pady=8).pack(side='left')
+
+        body = tk.Frame(self.win, bg=self._BG)
+        body.pack(fill='both', expand=True, padx=16, pady=12)
+
+        # ── Helper: labelled combo row ─────────────────────────────────────────
+        def _combo_row(parent, label: str, var: tk.StringVar,
+                       values: list, callback=None) -> ttk.Combobox:
+            row = tk.Frame(parent, bg=self._BG_MED)
+            row.pack(fill='x', pady=3)
+            tk.Label(row, text=label, width=24, anchor='w',
+                bg=self._BG_MED, fg=self._FG,
+                font=('Segoe UI', 9)).pack(side='left', padx=10, pady=6)
+            cb = ttk.Combobox(row, textvariable=var, values=values,
+                              state='readonly', width=34,
+                              font=('Segoe UI', 9))
+            cb.pack(side='left', padx=6, pady=6)
+            if callback:
+                cb.bind('<<ComboboxSelected>>', callback)
+            return cb
+
+        # ══════════════════════════════════════════════════════════════════════
+        # § A — Nodes sheet
+        # ══════════════════════════════════════════════════════════════════════
+        self._sec_label(body, 'A  NODE COORDINATES SHEET')
+        node_card = tk.Frame(body, bg=self._BG_MED)
+        node_card.pack(fill='x', pady=(0, 6))
+
+        self._nodes_tab_var = tk.StringVar(value='Nodes')
+        _combo_row(node_card, 'Tab that contains node data:',
+                   self._nodes_tab_var, opts,
+                   callback=self._on_nodes_tab_changed)
+
+        # Sub-row: choose which column is Node_ID
+        sub = tk.Frame(node_card, bg=self._BG_MED)
+        sub.pack(fill='x', padx=10, pady=(0, 8))
+        tk.Label(sub, text='Node ID column:',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left', padx=2)
+        self._node_id_col_var = tk.StringVar(value='Node_ID')
+        self._node_id_cb = ttk.Combobox(sub,
+            textvariable=self._node_id_col_var,
+            values=[], state='readonly', width=18,
+            font=('Segoe UI', 8))
+        self._node_id_cb.pack(side='left', padx=4)
+        tk.Label(sub,
+            text='  X col:', bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left')
+        self._node_x_var = tk.StringVar(value='X')
+        self._node_x_cb = ttk.Combobox(sub,
+            textvariable=self._node_x_var,
+            values=[], state='readonly', width=10,
+            font=('Segoe UI', 8))
+        self._node_x_cb.pack(side='left', padx=2)
+        tk.Label(sub,
+            text='Y:', bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left')
+        self._node_y_var = tk.StringVar(value='Y')
+        self._node_y_cb = ttk.Combobox(sub,
+            textvariable=self._node_y_var,
+            values=[], state='readonly', width=10,
+            font=('Segoe UI', 8))
+        self._node_y_cb.pack(side='left', padx=2)
+        tk.Label(sub,
+            text='Z:', bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left')
+        self._node_z_var = tk.StringVar(value='Z')
+        self._node_z_cb = ttk.Combobox(sub,
+            textvariable=self._node_z_var,
+            values=[], state='readonly', width=10,
+            font=('Segoe UI', 8))
+        self._node_z_cb.pack(side='left', padx=2)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # § B — Elements sheet + node-column range selector
+        # ══════════════════════════════════════════════════════════════════════
+        self._sec_label(body, 'B  ELEMENT CONNECTIVITY SHEET')
+        elem_card = tk.Frame(body, bg=self._BG_MED)
+        elem_card.pack(fill='x', pady=(0, 6))
+
+        self._elem_tab_var = tk.StringVar(value='Elements')
+        _combo_row(elem_card, 'Tab that contains element data:',
+                   self._elem_tab_var, opts,
+                   callback=self._on_elem_tab_changed)
+
+        # Element ID column
+        sub2 = tk.Frame(elem_card, bg=self._BG_MED)
+        sub2.pack(fill='x', padx=10, pady=(0, 4))
+        tk.Label(sub2, text='Element ID column:',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left', padx=2)
+        self._elem_id_col_var = tk.StringVar(value='Element_ID')
+        self._elem_id_cb = ttk.Combobox(sub2,
+            textvariable=self._elem_id_col_var,
+            values=[], state='readonly', width=18,
+            font=('Segoe UI', 8))
+        self._elem_id_cb.pack(side='left', padx=4)
+
+        # Node column range selector — the key feature
+        sub3 = tk.Frame(elem_card, bg=self._BG_MED)
+        sub3.pack(fill='x', padx=10, pady=(0, 8))
+        tk.Label(sub3,
+            text='Node connectivity columns  —  from:',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left', padx=2)
+        self._node_col_first_var = tk.StringVar(value='N1')
+        self._node_col_first_cb = ttk.Combobox(sub3,
+            textvariable=self._node_col_first_var,
+            values=[], state='readonly', width=12,
+            font=('Segoe UI', 8))
+        self._node_col_first_cb.pack(side='left', padx=4)
+        self._node_col_first_cb.bind(
+            '<<ComboboxSelected>>', self._on_node_range_changed)
+        tk.Label(sub3, text='to:',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left')
+        self._node_col_last_var = tk.StringVar(value='N8')
+        self._node_col_last_cb = ttk.Combobox(sub3,
+            textvariable=self._node_col_last_var,
+            values=[], state='readonly', width=12,
+            font=('Segoe UI', 8))
+        self._node_col_last_cb.pack(side='left', padx=4)
+        self._node_col_last_cb.bind(
+            '<<ComboboxSelected>>', self._on_node_range_changed)
+
+        # Live preview label showing detected node-column count
+        self._node_range_info = tk.Label(sub3, text='',
+            bg=self._BG_MED, fg=self._GREEN,
+            font=('Consolas', 8))
+        self._node_range_info.pack(side='left', padx=10)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # § C — Results sheet + scalar column picker
+        # ══════════════════════════════════════════════════════════════════════
+        self._sec_label(body, 'C  RESULTS / SCALAR SHEET')
+        res_card = tk.Frame(body, bg=self._BG_MED)
+        res_card.pack(fill='x', pady=(0, 6))
+
+        self._result_tab_var = tk.StringVar(value='Results')
+        _combo_row(res_card, 'Tab that contains results:',
+                   self._result_tab_var, opts,
+                   callback=self._on_result_tab_changed)
+
+        sub4 = tk.Frame(res_card, bg=self._BG_MED)
+        sub4.pack(fill='x', padx=10, pady=(0, 4))
+        tk.Label(sub4, text='Node ID column:',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8)).pack(side='left', padx=2)
+        self._res_id_col_var = tk.StringVar(value='Node_ID')
+        self._res_id_cb = ttk.Combobox(sub4,
+            textvariable=self._res_id_col_var,
+            values=[], state='readonly', width=18,
+            font=('Segoe UI', 8))
+        self._res_id_cb.pack(side='left', padx=4)
+
+        # Scalar column multi-selector (Listbox with scrollbar)
+        sub5 = tk.Frame(res_card, bg=self._BG_MED)
+        sub5.pack(fill='x', padx=10, pady=(0, 8))
+        tk.Label(sub5, text='Scalar columns to render\n(Ctrl+click to multi-select):',
+            bg=self._BG_MED, fg=self._MUTED,
+            font=('Segoe UI', 8), justify='left').pack(
+            side='left', anchor='n', padx=2)
+        lb_frame = tk.Frame(sub5, bg=self._BG_MED)
+        lb_frame.pack(side='left', padx=8)
+        self._scalar_lb = tk.Listbox(lb_frame,
+            selectmode='multiple',
+            bg=self._BG_LIGHT, fg=self._FG,
+            selectbackground=self._ACCENT, selectforeground='#1a1d23',
+            font=('Consolas', 8),
+            height=5, width=28,
+            relief='flat', activestyle='none')
+        lb_vsb = tk.Scrollbar(lb_frame, orient='vertical',
+                              command=self._scalar_lb.yview,
+                              bg=self._BG_MED)
+        self._scalar_lb.configure(yscrollcommand=lb_vsb.set)
+        lb_vsb.pack(side='right', fill='y')
+        self._scalar_lb.pack(side='left', fill='both')
+
+        # ── Bottom bar ────────────────────────────────────────────────────────
+        bot = tk.Frame(self.win, bg=self._BG_MED, relief='groove', bd=1)
+        bot.pack(fill='x', side='bottom', padx=16, pady=8)
+
+        tk.Button(bot, text='⬡  Apply & Render in 3D',
+            command=self._apply,
+            bg='#0d47a1', fg='white',
+            font=('Segoe UI', 9, 'bold'),
+            relief='flat', padx=14, pady=7,
+            cursor='hand2').pack(side='left', padx=4)
+        tk.Button(bot, text='Cancel', command=self.win.destroy,
+            font=('Segoe UI', 9), relief='flat',
+            bg='#37474F', fg='white',
+            padx=12, pady=7, cursor='hand2').pack(side='right', padx=4)
+        self._status_lbl = tk.Label(bot, text='Select tabs then click Apply.',
+            font=('Segoe UI', 8), fg=self._MUTED,
+            bg=self._BG_MED, anchor='w')
+        self._status_lbl.pack(side='left', padx=10, fill='x', expand=True)
+
+        # ── Populate all combos from default selections ────────────────────────
+        self._on_nodes_tab_changed()
+        self._on_elem_tab_changed()
+        self._on_result_tab_changed()
+
+    # ── Section header helper ─────────────────────────────────────────────────
+
+    def _sec_label(self, parent: tk.Frame, title: str) -> None:
+        tk.Frame(parent, bg=self._BORDER, height=1).pack(
+            fill='x', pady=(10, 0))
+        tk.Label(parent, text=f'  {title}',
+            bg='#1565C0', fg='white',
+            font=('Segoe UI', 8, 'bold'),
+            anchor='w').pack(fill='x', ipady=3)
+
+    # ── Column-list helpers ───────────────────────────────────────────────────
+
+    def _cols_for(self, tab_name: str) -> list:
+        """Return column list for the named tab, or [] if tab is '— none —'."""
+        df = self._tabs.get(tab_name)
+        return list(df.columns) if df is not None else []
+
+    def _set_combo_cols(self, cb: ttk.Combobox, var: tk.StringVar,
+                        cols: list, prefer: list) -> None:
+        """Populate a Combobox with cols; auto-select first preferred match."""
+        cb.configure(values=cols)
+        for p in prefer:
+            if p in cols:
+                var.set(p)
+                return
+        if cols:
+            var.set(cols[0])
+        else:
+            var.set('')
+
+    # ── Tab-change callbacks ──────────────────────────────────────────────────
+
+    def _on_nodes_tab_changed(self, _event=None) -> None:
+        cols = self._cols_for(self._nodes_tab_var.get())
+        self._set_combo_cols(self._node_id_cb,  self._node_id_col_var,
+                             cols, ['Node_ID', 'NodeID', 'ID', 'node_id'])
+        self._set_combo_cols(self._node_x_cb,   self._node_x_var,
+                             cols, ['X', 'x', 'X_COORD'])
+        self._set_combo_cols(self._node_y_cb,   self._node_y_var,
+                             cols, ['Y', 'y', 'Y_COORD'])
+        self._set_combo_cols(self._node_z_cb,   self._node_z_var,
+                             cols, ['Z', 'z', 'Z_COORD'])
+
+    def _on_elem_tab_changed(self, _event=None) -> None:
+        cols = self._cols_for(self._elem_tab_var.get())
+        self._set_combo_cols(self._elem_id_cb, self._elem_id_col_var,
+                             cols, ['Element_ID', 'ElemID', 'ID'])
+        # Auto-detect connectivity columns (columns whose names start with N
+        # followed by a digit, OR positional heuristic for generic imports)
+        n_cols = [c for c in cols
+                  if (c.startswith('N') and c[1:].isdigit())]
+        if not n_cols:
+            # Fallback: every column after the first non-coordinate column
+            n_cols = cols[1:] if len(cols) > 1 else cols
+        self._node_col_first_cb.configure(values=cols)
+        self._node_col_last_cb.configure(values=cols)
+        first = n_cols[0]  if n_cols else (cols[0] if cols else '')
+        last  = n_cols[-1] if n_cols else (cols[-1] if cols else '')
+        self._node_col_first_var.set(first)
+        self._node_col_last_var.set(last)
+        self._on_node_range_changed()
+
+    def _on_result_tab_changed(self, _event=None) -> None:
+        cols = self._cols_for(self._result_tab_var.get())
+        self._set_combo_cols(self._res_id_cb, self._res_id_col_var,
+                             cols, ['Node_ID', 'NodeID', 'ID', 'node_id'])
+        # Populate the scalar listbox with all numeric-looking columns
+        # excluding obvious ID/index columns
+        self._scalar_lb.delete(0, 'end')
+        df = self._tabs.get(self._result_tab_var.get())
+        if df is None:
+            return
+        id_col = self._res_id_col_var.get()
+        skip   = {id_col, 'ResultIndex', 'ElemID', 'ElemType'}
+        for col in df.columns:
+            if col in skip:
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                self._scalar_lb.insert('end', col)
+        # Default-select sensible scalars
+        pref = {'Von_Mises_Stress', 'SEQV', 'Temperature', 'TEMP',
+                'Disp_Magnitude', 'SX', 'SY', 'SZ'}
+        for i in range(self._scalar_lb.size()):
+            if self._scalar_lb.get(i) in pref:
+                self._scalar_lb.selection_set(i)
+        if self._scalar_lb.size() > 0 and not self._scalar_lb.curselection():
+            self._scalar_lb.selection_set(0)   # select at least one
+
+    def _on_node_range_changed(self, _event=None) -> None:
+        """Update the live preview label showing detected node-column count."""
+        cols  = self._cols_for(self._elem_tab_var.get())
+        first = self._node_col_first_var.get()
+        last  = self._node_col_last_var.get()
+        if not cols or not first or not last:
+            self._node_range_info.config(text='')
+            return
+        try:
+            i0 = cols.index(first)
+            i1 = cols.index(last)
+        except ValueError:
+            self._node_range_info.config(text='⚠ column not found',
+                                          fg=self._RED)
+            return
+        if i1 < i0:
+            self._node_range_info.config(text='⚠ end < start',
+                                          fg=self._RED)
+            return
+        n_node_cols = i1 - i0 + 1
+        elem_type = {4: 'Tet4', 6: 'Wedge6', 8: 'Hex8',
+                     10: 'Tet10', 20: 'Hex20'}.get(
+            n_node_cols, f'{n_node_cols}-node')
+        self._node_range_info.config(
+            text=f'→ {n_node_cols} node cols  ({elem_type})',
+            fg=self._GREEN)
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
+
+    def _apply(self) -> None:
+        """Validate selections and call app._on_sheet_roles_assigned()."""
+        NONE = '— none —'
+
+        # ── Nodes ─────────────────────────────────────────────────────────────
+        nodes_tab = self._nodes_tab_var.get()
+        if nodes_tab == NONE:
+            self._set_status('⚠  Select a tab for node coordinates.', err=True)
+            return
+        nodes_df = self._tabs[nodes_tab].copy()
+        id_col   = self._node_id_col_var.get()
+        x_col    = self._node_x_var.get()
+        y_col    = self._node_y_var.get()
+        z_col    = self._node_z_var.get()
+        for col, label in [(id_col,'Node ID'), (x_col,'X'), (y_col,'Y'), (z_col,'Z')]:
+            if col not in nodes_df.columns:
+                self._set_status(f'⚠  Column "{col}" not in nodes tab.', err=True)
+                return
+        nodes_out = nodes_df[[id_col, x_col, y_col, z_col]].copy()
+        nodes_out.columns = ['Node_ID', 'X', 'Y', 'Z']
+        nodes_out['Node_ID'] = pd.to_numeric(nodes_out['Node_ID'],
+                                             errors='coerce').fillna(0).astype(int)
+        for c in ('X', 'Y', 'Z'):
+            nodes_out[c] = pd.to_numeric(nodes_out[c],
+                                         errors='coerce').fillna(0.0)
+
+        # ── Elements ──────────────────────────────────────────────────────────
+        elem_tab = self._elem_tab_var.get()
+        if elem_tab == NONE:
+            self._set_status('⚠  Select a tab for element connectivity.', err=True)
+            return
+        elem_df    = self._tabs[elem_tab].copy()
+        elem_id_c  = self._elem_id_col_var.get()
+        first_nc   = self._node_col_first_var.get()
+        last_nc    = self._node_col_last_var.get()
+        cols       = list(elem_df.columns)
+        try:
+            i0 = cols.index(first_nc)
+            i1 = cols.index(last_nc)
+        except ValueError as exc:
+            self._set_status(f'⚠  Node column not found: {exc}', err=True)
+            return
+        if i1 < i0:
+            self._set_status('⚠  End column is before start column.', err=True)
+            return
+        node_cols = cols[i0 : i1 + 1]
+        keep_cols = ([elem_id_c] if elem_id_c in cols else []) + node_cols
+        elem_out  = elem_df[keep_cols].copy()
+        # Normalise column names → Element_ID, N1, N2, …
+        rename = {}
+        if elem_id_c in elem_out.columns:
+            rename[elem_id_c] = 'Element_ID'
+        for j, nc in enumerate(node_cols, 1):
+            rename[nc] = f'N{j}'
+        elem_out = elem_out.rename(columns=rename)
+        if 'Element_ID' not in elem_out.columns:
+            elem_out.insert(0, 'Element_ID', range(1, len(elem_out) + 1))
+        elem_out['Element_ID'] = pd.to_numeric(
+            elem_out['Element_ID'], errors='coerce').fillna(0).astype(int)
+        for nc in [f'N{j}' for j in range(1, len(node_cols) + 1)]:
+            elem_out[nc] = pd.to_numeric(
+                elem_out[nc], errors='coerce').fillna(0).astype(int)
+
+        # ── Results ───────────────────────────────────────────────────────────
+        res_tab = self._result_tab_var.get()
+        sel_idx = list(self._scalar_lb.curselection())
+        if res_tab == NONE or not sel_idx:
+            # Results are optional — build a zero-filled placeholder
+            results_out = pd.DataFrame({'Node_ID': nodes_out['Node_ID']})
+            scalar_cols = []
+            self._set_status('ℹ  No results tab — rendering geometry only.')
+        else:
+            res_df      = self._tabs[res_tab].copy()
+            res_id_col  = self._res_id_col_var.get()
+            scalar_cols = [self._scalar_lb.get(i) for i in sel_idx]
+            missing_sc  = [c for c in scalar_cols if c not in res_df.columns]
+            if missing_sc:
+                self._set_status(f'⚠  Scalar columns missing: {missing_sc}',
+                                 err=True)
+                return
+            keep = ([res_id_col] if res_id_col in res_df.columns else []) + \
+                   scalar_cols
+            results_out = res_df[keep].copy()
+            rename_r    = {res_id_col: 'Node_ID'} if res_id_col in results_out else {}
+            results_out = results_out.rename(columns=rename_r)
+            if 'Node_ID' not in results_out.columns:
+                results_out.insert(0, 'Node_ID', nodes_out['Node_ID'].values)
+            results_out['Node_ID'] = pd.to_numeric(
+                results_out['Node_ID'], errors='coerce').fillna(0).astype(int)
+            for sc in scalar_cols:
+                results_out[sc] = pd.to_numeric(
+                    results_out[sc], errors='coerce').fillna(0.0)
+
+        # If no scalar cols, add a zero placeholder so the VTK grid can render
+        if not scalar_cols:
+            results_out['Geometry'] = 0.0
+            scalar_cols = ['Geometry']
+
+        self._set_status('Applying…')
+        self.win.update_idletasks()
+
+        self.app._on_sheet_roles_assigned(
+            nodes_df    = nodes_out,
+            elements_df = elem_out,
+            results_df  = results_out,
+            scalar_cols = scalar_cols,
+            source_label= f'{nodes_tab} / {elem_tab} / {res_tab}',
+        )
+        self.win.after(400, self.win.destroy)
+
+    def _set_status(self, msg: str, err: bool = False) -> None:
+        self._status_lbl.configure(
+            text=msg,
+            fg=(self._RED if err else self._MUTED))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # § 6  ANSYS IMPORT DIALOG
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1372,6 +1866,7 @@ class FEAPostProcessor:
         self.root.bind('<Control-r>', lambda _e: self._cmd_reset_camera())
         self.root.bind('<Control-e>', lambda _e: self._cmd_toggle_edges())
         self.root.bind('<F5>',        lambda _e: self._cmd_auto_scale())
+        self.root.bind('<Control-w>', lambda _e: self._cmd_clear_session())
 
     # ══════════════════════════════════════════════════════════════════════════
     # Menu bar
@@ -1389,6 +1884,8 @@ class FEAPostProcessor:
         fm.add_separator()
         fm.add_command(label='Load Synthetic Demo Data',
                        command=self._cmd_load_demo)
+        fm.add_command(label='Clear Session  (Ctrl+W)',
+                       command=self._cmd_clear_session)
         fm.add_separator()
         fm.add_command(label='Exit', command=self.root.quit)
         mb.add_cascade(label='File', menu=fm)
@@ -1489,7 +1986,11 @@ class FEAPostProcessor:
             font=('Consolas', 8)).pack(anchor='w', **p, pady=(6, 4))
         ttk.Button(card, text='⚙  Import ANSYS File…',
             style='Accent.TButton',
-            command=self._cmd_import_ansys).pack(fill='x', **p, pady=(0, 10))
+            command=self._cmd_import_ansys).pack(fill='x', **p, pady=(0, 4))
+        ttk.Button(card, text='⊞  Assign Sheet Roles…',
+            command=self._cmd_assign_sheets).pack(fill='x', **p, pady=(0, 4))
+        ttk.Button(card, text='✕  Clear Session',
+            command=self._cmd_clear_session).pack(fill='x', **p, pady=(0, 10))
 
         # § Result field ───────────────────────────────────────────────────────
         self._sidebar_section(parent, '  RESULT FIELD')
@@ -2327,7 +2828,171 @@ class FEAPostProcessor:
         self._render_mesh()
         self._set_status('Colorbar auto-scaled to full data range.')
 
+    def _cmd_clear_session(self) -> None:
+        """
+        Wipe all imported data and return the application to a blank state.
+        The 3D viewport is cleared, the data grid tabs are reset to empty
+        frames, and all sidebar controls are reset to defaults.
+        """
+        if not messagebox.askyesno(
+                'Clear Session',
+                'Remove all imported data and reset to a blank session?\n\n'
+                'The synthetic demo data will NOT be reloaded.\n'
+                'Use File → Load Synthetic Demo Data to restore it.',
+                icon='warning', parent=self.root):
+            return
+
+        # ── 1. Stop any pending highlight / probe state ───────────────────────
+        self._picking_var.set(False)
+        self._write_probe('Awaiting selection…')
+        self._coord_var.set('')
+
+        # ── 2. Clear VTK actors ───────────────────────────────────────────────
+        if VTK_AVAILABLE:
+            for attr in ('_actor', '_scalar_bar', '_highlight_actor'):
+                a = getattr(self, attr, None)
+                if a is not None:
+                    self._renderer.RemoveActor(a)
+                    setattr(self, attr, None)
+            self._render_window.Render()
+
+        # ── 3. Reset data layer to minimal empty DataFrames ───────────────────
+        self.nodes_df = pd.DataFrame(columns=['Node_ID', 'X', 'Y', 'Z'])
+        self.elements_df = pd.DataFrame(
+            columns=['Element_ID', 'N1', 'N2', 'N3', 'N4',
+                     'N5', 'N6', 'N7', 'N8'])
+        self.results_df  = pd.DataFrame(columns=['Node_ID'])
+        self._scalar_cols  = []
+        self._source_label = 'Empty session'
+
+        # ── 4. Remove all dynamically-added tabs from the right panel ─────────
+        for name in list(self._imported_tabs.keys()):
+            if name in self._sheet_frames:
+                self._sheet_frames[name].pack_forget()
+                self._sheet_frames[name].destroy()
+                del self._sheet_frames[name]
+            if name in self._tab_buttons:
+                self._tab_buttons[name].destroy()
+                del self._tab_buttons[name]
+        self._imported_tabs.clear()
+
+        # ── 5. Refresh the three built-in sheets with empty DataFrames ────────
+        for name, df in [('Nodes',    self.nodes_df),
+                          ('Elements', self.elements_df),
+                          ('Results',  self.results_df)]:
+            self._populate_sheet_frame(self._sheet_frames[name], df)
+        self._switch_grid_tab('Nodes')
+
+        # ── 6. Reset sidebar controls ─────────────────────────────────────────
+        self.active_result.set('')
+        self._result_cb.configure(values=[])
+        self.colorbar_min.set(0.0)
+        self.colorbar_max.set(1.0)
+        self._refresh_stats_card()
+        self._source_lbl_var.set('Empty session — import a file to begin')
+        self._set_status('Session cleared.  Use File → Import ANSYS File to load data.')
     def _cmd_load_demo(self) -> None:
+        if not messagebox.askyesno('Load Demo',
+                                   'Reload the synthetic demo dataset?\n'
+                                   'All imported ANSYS data will be replaced.'):
+            return
+        self.nodes_df, self.elements_df, self.results_df = \
+            generate_synthetic_fea_data()
+        self._scalar_cols  = ['Von_Mises_Stress', 'Temperature']
+        self._source_label = 'Synthetic (demo)'
+
+        if VTK_AVAILABLE:
+            self.grid = build_vtk_unstructured_grid(
+                self.nodes_df, self.elements_df,
+                self.results_df, self._scalar_cols)
+
+        self.active_result.set(self._scalar_cols[0])
+        self._result_cb.configure(values=self._scalar_cols)
+        self._update_scalar_range_vars()
+
+        for name, df in [('Nodes',    self.nodes_df),
+                          ('Elements', self.elements_df),
+                          ('Results',  self.results_df)]:
+            self._populate_sheet_frame(self._sheet_frames[name], df)
+
+        self._refresh_stats_card()
+        self._source_lbl_var.set('Synthetic (demo)')
+
+        if VTK_AVAILABLE:
+            self._actor = None   # force camera reset
+            self._render_mesh()
+        self._set_status('Synthetic demo dataset loaded.')
+    def _cmd_assign_sheets(self) -> None:
+        """
+        Open the Sheet Role Assignment dialog.
+        Available whenever there is at least one imported tab
+        (even the default Nodes/Elements/Results sheets).
+        """
+        SheetRoleDialog(self.root, self)
+
+    def _on_sheet_roles_assigned(
+        self,
+        nodes_df:    'pd.DataFrame',
+        elements_df: 'pd.DataFrame',
+        results_df:  'pd.DataFrame',
+        scalar_cols: list,
+        source_label: str,
+    ) -> None:
+        """
+        Receive role-assigned DataFrames from SheetRoleDialog and rebuild
+        the entire viewer state — identical pipeline to a fresh RST import.
+
+        Parameters
+        ----------
+        nodes_df     : [Node_ID, X, Y, Z]
+        elements_df  : [Element_ID, N1…Nn]
+        results_df   : [Node_ID, <scalar cols…>]
+        scalar_cols  : ordered list of renderable scalar column names
+        source_label : human-readable description for the title bar
+        """
+        self.nodes_df     = nodes_df
+        self.elements_df  = elements_df
+        self.results_df   = results_df
+        self._scalar_cols = scalar_cols
+        self._source_label = source_label
+
+        # Refresh built-in sheet frames
+        for name, df in [('Nodes',    self.nodes_df),
+                          ('Elements', self.elements_df),
+                          ('Results',  self.results_df)]:
+            self._populate_sheet_frame(self._sheet_frames[name], df)
+
+        # Rebuild VTK grid
+        if VTK_AVAILABLE and scalar_cols:
+            try:
+                self.grid = build_vtk_unstructured_grid(
+                    self.nodes_df, self.elements_df,
+                    self.results_df, self._scalar_cols)
+            except Exception as exc:
+                messagebox.showerror('VTK Grid Error',
+                    f'Failed to build mesh from assigned sheets:\n{exc}')
+                return
+
+        # Update sidebar
+        first_scalar = scalar_cols[0] if scalar_cols else ''
+        self.active_result.set(first_scalar)
+        self._result_cb.configure(values=scalar_cols)
+        if scalar_cols:
+            self._update_scalar_range_vars()
+        self._refresh_stats_card()
+        self._source_lbl_var.set(
+            f'{source_label}  ·  '
+            f'{len(nodes_df):,} nodes  '
+            f'{len(elements_df):,} elements  '
+            f'{len(scalar_cols)} scalars')
+
+        # Re-render (force camera reset by clearing old actor)
+        if VTK_AVAILABLE and scalar_cols:
+            self._actor = None
+            self._render_mesh()
+
+        self._set_status(
+            f'Sheet roles assigned — rendered from: {source_label}')
         if not messagebox.askyesno('Load Demo',
                                    'Reload the synthetic demo dataset?\n'
                                    'All imported ANSYS data will be replaced.'):
@@ -2382,6 +3047,7 @@ class FEAPostProcessor:
             '  Ctrl+O  Import ANSYS file\n'
             '  Ctrl+R  Reset camera\n'
             '  Ctrl+E  Toggle edges\n'
+            '  Ctrl+W  Clear session\n'
             '  F5      Auto-scale colorbar')
 
     # ── Utilities ─────────────────────────────────────────────────────────────
