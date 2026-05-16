@@ -2891,37 +2891,7 @@ class FEAPostProcessor:
         self._refresh_stats_card()
         self._source_lbl_var.set('Empty session — import a file to begin')
         self._set_status('Session cleared.  Use File → Import ANSYS File to load data.')
-    def _cmd_load_demo(self) -> None:
-        if not messagebox.askyesno('Load Demo',
-                                   'Reload the synthetic demo dataset?\n'
-                                   'All imported ANSYS data will be replaced.'):
-            return
-        self.nodes_df, self.elements_df, self.results_df = \
-            generate_synthetic_fea_data()
-        self._scalar_cols  = ['Von_Mises_Stress', 'Temperature']
-        self._source_label = 'Synthetic (demo)'
 
-        if VTK_AVAILABLE:
-            self.grid = build_vtk_unstructured_grid(
-                self.nodes_df, self.elements_df,
-                self.results_df, self._scalar_cols)
-
-        self.active_result.set(self._scalar_cols[0])
-        self._result_cb.configure(values=self._scalar_cols)
-        self._update_scalar_range_vars()
-
-        for name, df in [('Nodes',    self.nodes_df),
-                          ('Elements', self.elements_df),
-                          ('Results',  self.results_df)]:
-            self._populate_sheet_frame(self._sheet_frames[name], df)
-
-        self._refresh_stats_card()
-        self._source_lbl_var.set('Synthetic (demo)')
-
-        if VTK_AVAILABLE:
-            self._actor = None   # force camera reset
-            self._render_mesh()
-        self._set_status('Synthetic demo dataset loaded.')
     def _cmd_assign_sheets(self) -> None:
         """
         Open the Sheet Role Assignment dialog.
@@ -2993,6 +2963,9 @@ class FEAPostProcessor:
 
         self._set_status(
             f'Sheet roles assigned — rendered from: {source_label}')
+
+    def _cmd_load_demo(self) -> None:
+        """Reload the synthetic Hex8 demo dataset and re-render."""
         if not messagebox.askyesno('Load Demo',
                                    'Reload the synthetic demo dataset?\n'
                                    'All imported ANSYS data will be replaced.'):
