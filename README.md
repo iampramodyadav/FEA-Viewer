@@ -7,7 +7,7 @@ with a hardware-accelerated VTK/PyVista 3D graphics pipeline.
 ---
 
 ## Architecture Overview
-
+![](gui.png)
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        FEAPostProcessor                             │
