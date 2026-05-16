@@ -29,13 +29,20 @@ import numpy as np
 import pandas as pd
 
 # ── Optional VTK / PyVista ────────────────────────────────────────────────────
+# Strategy: avoid vtkTkRenderWindowInteractor entirely.
+#   • On Windows: embed via SetParentId(HWND)  — bypasses vtkRenderingTk.dll
+#   • On Linux/macOS: embed via SetWindowInfo(str(XID/NSView))
+# A Tk polling loop (root.after) drives the interactor instead of its own
+# event loop, so Tkinter keeps full control.
 try:
     import pyvista as pv
     import vtk
-    from vtk.tk.vtkTkRenderWindowInteractor import vtkTkRenderWindowInteractor
     VTK_AVAILABLE = True
 except ImportError:
     VTK_AVAILABLE = False
+
+# vtkTkRenderWindowInteractor is deliberately NOT imported — it requires
+# vtkRenderingTk.dll on Windows which is frequently missing from PATH.
 
 # ── Optional tksheet ──────────────────────────────────────────────────────────
 try:
@@ -1466,7 +1473,9 @@ class FEAPostProcessor:
         self._build_sidebar_content(self._sidebar_frame)
 
     def _build_sidebar_content(self, parent: tk.Frame) -> None:
-        p = {'padx': 12, 'pady': 0}
+        # Only padx is shared — pady is always specified explicitly per widget
+        # to avoid "multiple values for keyword argument 'pady'" on Python 3.10+
+        p = {'padx': 12}
         self._update_scalar_range_vars()
 
         # § ANSYS Import ───────────────────────────────────────────────────────
@@ -1766,40 +1775,166 @@ class FEAPostProcessor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _init_vtk_renderer(self) -> None:
-        self._vtk_widget = vtkTkRenderWindowInteractor(
+        """
+        Embed a VTK render window inside the Tkinter viewport frame without
+        using vtkTkRenderWindowInteractor (whose DLL is frequently missing on
+        Windows).
+
+        Strategy
+        --------
+        1. Create a plain tk.Canvas that fills the viewport frame.
+           The canvas gives us a stable, resizable native window handle.
+        2. Force Tkinter to realise the canvas so its HWND/XID exists.
+        3. Pass that handle to vtkRenderWindow so VTK draws into our widget.
+        4. Drive the vtkRenderWindowInteractor via a Tkinter polling loop
+           (root.after) instead of its own blocking event loop.
+        5. Forward Tkinter mouse/keyboard events to the VTK interactor so
+           rotation, zoom and pan work exactly as before.
+        """
+        # ── 1. Native canvas (VTK draws here) ────────────────────────────────
+        self._vtk_canvas = tk.Canvas(
             self._viewport_frame,
-            rw=vtk.vtkRenderWindow(),
-            width=800, height=600)
-        self._vtk_widget.pack(fill='both', expand=True)
+            bg='#111418',
+            highlightthickness=0)
+        self._vtk_canvas.pack(fill='both', expand=True)
 
-        self._render_window = self._vtk_widget.GetRenderWindow()
-        self._render_window.SetMultiSamples(4)   # MSAA anti-aliasing
+        # Force Tk to realise the widget so winfo_id() returns a valid handle
+        self._vtk_canvas.update()
 
-        self._plotter  = pv.Plotter(off_screen=False)
-        self._plotter.ren_win = self._render_window
-        self._renderer = self._plotter.renderer
+        # ── 2. Render window ──────────────────────────────────────────────────
+        self._render_window = vtk.vtkRenderWindow()
+        self._render_window.SetMultiSamples(4)    # MSAA anti-aliasing
+        self._render_window.SetBorders(0)         # suppress OS window chrome
+
+        # SetWindowInfo(str) is the universal cross-platform embed API:
+        #   Windows  -> HWND as decimal string
+        #   Linux    -> X11 XID as decimal string
+        #   macOS    -> NSView pointer as decimal string
+        # This avoids SetParentId() which requires a ctypes c_void_p on Windows.
+        handle_str = str(int(self._vtk_canvas.winfo_id()))
+        self._render_window.SetWindowInfo(handle_str)
+
+        # Size to match the realised canvas (falls back to 800x600 if not yet mapped)
+        w = self._vtk_canvas.winfo_width()
+        h = self._vtk_canvas.winfo_height()
+        if w < 2 or h < 2:          # canvas not yet painted -- use a safe default
+            w, h = 800, 600
+        self._render_window.SetSize(w, h)
+
+        # ── 3. Renderer ───────────────────────────────────────────────────────
+        self._renderer = vtk.vtkRenderer()
+        self._renderer.SetBackground(0.11, 0.13, 0.17)
+        self._renderer.SetBackground2(0.07, 0.08, 0.11)
+        self._renderer.GradientBackgroundOn()
         self._render_window.AddRenderer(self._renderer)
 
-        # TrackballCamera: left-drag=rotate, right-drag=zoom, middle=pan
-        self._vtk_widget.SetInteractorStyle(
+        # ── 4. Interactor (no event loop — driven by Tk polling) ──────────────
+        self._interactor = vtk.vtkRenderWindowInteractor()
+        self._interactor.SetRenderWindow(self._render_window)
+        self._interactor.SetInteractorStyle(
             vtk.vtkInteractorStyleTrackballCamera())
+        self._interactor.Initialize()
+        # Do NOT call self._interactor.Start() — that would block Tk's loop.
 
-        # Orientation axes widget (bottom-left)
+        # ── 5. Orientation axes widget ────────────────────────────────────────
         self._axes_widget = vtk.vtkOrientationMarkerWidget()
         self._axes_widget.SetOrientationMarker(vtk.vtkAxesActor())
-        self._axes_widget.SetInteractor(self._vtk_widget)
+        self._axes_widget.SetInteractor(self._interactor)
         self._axes_widget.SetViewport(0.0, 0.0, 0.18, 0.18)
         self._axes_widget.SetEnabled(1)
         self._axes_widget.InteractiveOff()
 
-        # Dark gradient background
-        self._renderer.SetBackground(0.11, 0.13, 0.17)
-        self._renderer.SetBackground2(0.07, 0.08, 0.11)
-        self._renderer.GradientBackgroundOn()
+        # ── 6. Forward Tkinter events → VTK interactor ────────────────────────
+        self._bind_vtk_events()
 
-        self._vtk_widget.Initialize()
-        self._vtk_widget.Start()
-        self._set_status('3D renderer ready (VTK + PyVista).')
+        # ── 7. Resize handler ─────────────────────────────────────────────────
+        self._vtk_canvas.bind('<Configure>', self._on_viewport_resize)
+
+        # ── 8. Tk polling loop — keeps VTK responsive without blocking Tk ─────
+        self._vtk_poll_active = True
+        self._vtk_poll()
+
+        self._set_status('3D renderer ready (VTK + PyVista — native embed).')
+
+    def _bind_vtk_events(self) -> None:
+        """
+        Translate Tkinter mouse/keyboard events into VTK interactor calls.
+        This gives us rotate, zoom, pan, and pick without vtkTkRenderWindowInteractor.
+        """
+        c = self._vtk_canvas
+        iren = self._interactor
+
+        # Helper: update VTK's internal mouse position then fire the event
+        def _pos(event):
+            # VTK origin is bottom-left; Tk origin is top-left
+            h = c.winfo_height()
+            iren.SetEventInformationFlipY(
+                event.x, event.y,          # SetEventInformationFlipY flips Y
+                0, 0,                       # ctrl, shift
+                chr(0), 0, None)
+            return event.x, h - event.y    # unused but handy for debugging
+
+        # ── Mouse buttons ─────────────────────────────────────────────────────
+        c.bind('<ButtonPress-1>',   lambda e: (_pos(e), iren.LeftButtonPressEvent()))
+        c.bind('<ButtonRelease-1>', lambda e: (_pos(e), iren.LeftButtonReleaseEvent()))
+        c.bind('<ButtonPress-2>',   lambda e: (_pos(e), iren.MiddleButtonPressEvent()))
+        c.bind('<ButtonRelease-2>', lambda e: (_pos(e), iren.MiddleButtonReleaseEvent()))
+        c.bind('<ButtonPress-3>',   lambda e: (_pos(e), iren.RightButtonPressEvent()))
+        c.bind('<ButtonRelease-3>', lambda e: (_pos(e), iren.RightButtonReleaseEvent()))
+
+        # ── Mouse motion ──────────────────────────────────────────────────────
+        c.bind('<B1-Motion>', lambda e: (_pos(e), iren.MouseMoveEvent()))
+        c.bind('<B2-Motion>', lambda e: (_pos(e), iren.MouseMoveEvent()))
+        c.bind('<B3-Motion>', lambda e: (_pos(e), iren.MouseMoveEvent()))
+
+        # ── Scroll wheel ──────────────────────────────────────────────────────
+        def _scroll(event):
+            _pos(event)
+            if event.delta > 0 or event.num == 4:
+                iren.MouseWheelForwardEvent()
+            else:
+                iren.MouseWheelBackwardEvent()
+
+        c.bind('<MouseWheel>', _scroll)          # Windows / macOS
+        c.bind('<Button-4>',   _scroll)          # Linux scroll up
+        c.bind('<Button-5>',   _scroll)          # Linux scroll down
+
+        # ── Keyboard ──────────────────────────────────────────────────────────
+        c.bind('<KeyPress>', lambda e: (
+            iren.SetKeySym(e.keysym),
+            iren.SetKeyCode(e.char if e.char else '\0'),
+            iren.KeyPressEvent(),
+            iren.CharEvent()))
+        c.bind('<KeyRelease>', lambda e: (
+            iren.SetKeySym(e.keysym),
+            iren.KeyReleaseEvent()))
+
+        # Give the canvas focus so keyboard events are received
+        c.bind('<Enter>', lambda _e: c.focus_set())
+
+    def _vtk_poll(self) -> None:
+        """
+        Lightweight Tkinter polling loop that lets VTK process its internal
+        timer events (camera inertia, widget updates, etc.) without blocking
+        Tkinter's own event loop.  Fires every 16 ms (~60 fps ceiling).
+        """
+        if not self._vtk_poll_active:
+            return
+        try:
+            if hasattr(self, '_interactor'):
+                self._interactor.ProcessEvents()
+                self._render_window.Render()
+        except Exception:
+            pass
+        self.root.after(16, self._vtk_poll)
+
+    def _on_viewport_resize(self, event: tk.Event) -> None:
+        """Keep the VTK render window in sync when the Tkinter canvas resizes."""
+        if hasattr(self, '_render_window'):
+            w = max(event.width,  1)
+            h = max(event.height, 1)
+            self._render_window.SetSize(w, h)
+            self._render_window.Render()
 
     def _show_vtk_fallback(self) -> None:
         tk.Label(self._viewport_frame,
@@ -1957,7 +2092,7 @@ class FEAPostProcessor:
                 return
             self._report_node(pid)
 
-        self._vtk_widget.AddObserver('LeftButtonPressEvent', on_click)
+        self._interactor.AddObserver('LeftButtonPressEvent', on_click)
 
     def _report_node(self, pid: int) -> None:
         """Extract and display all scalar values for a picked node."""
@@ -2282,6 +2417,14 @@ def main() -> None:
 
     root = tk.Tk()
     app  = FEAPostProcessor(root)   # noqa: F841
+
+    # Stop the VTK polling loop cleanly before Tkinter tears down its widgets
+    def _on_close():
+        if VTK_AVAILABLE and hasattr(app, '_vtk_poll_active'):
+            app._vtk_poll_active = False
+        root.destroy()
+
+    root.protocol('WM_DELETE_WINDOW', _on_close)
 
     if VTK_AVAILABLE:
         root.after(200, app._render_mesh)
