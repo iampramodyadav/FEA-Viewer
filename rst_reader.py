@@ -1,127 +1,91 @@
 """
-rst_reader.py — Lightweight ANSYS RST binary reader
-=====================================================
-Verified against a real CMS superelement RST file.
+rst_reader.py  —  Lightweight ANSYS RST binary reader
+======================================================
+Requires: numpy  +  ansys-mapdl-reader (pip install ansys-mapdl-reader)
 
-Ground-truth binary format findings
--------------------------------------
-1.  File starts with a standard Fortran record (100B in this file).
-2.  Immediately follows a 16384B PAGE BLOCK (record 1).
-    The 20-item result header lives at i32 offset 76 within the page payload.
-    This is why pymapdl-reader uses read_record(103): byte 412 = word 103
-    lands exactly on the payload of that page block.
-3.  KEY FIELDS in the result header (i32 offset within page payload from offset 76):
-        [0]  fun12      (-2147483648 sentinel)
-        [1]  maxn       (max master node count in CMS, or max node num)
-        [2]  numdof     (total interface DOF count for CMS, or dof/node)
-        [3]  maxe       (number of elements)
-        [4]  nsets      (pre-allocated result slots = resmax, NOT actual count)
-        [9]  ptrDSI
-        [10] ptrTIM     (may be stale/zero — do not rely on it)
-        [11] ptrLSP     → points to the DATASET INDEX BLOCK
-        [13] ptrGEO     → geometry block
-        [15] CMSflg     (nonzero = CMS superelement file)
-4.  ptrLSP points to: [fun12:i32] [ptr0:i32] [ptr1:i32] ... [0:i32 ...]
-    Each ptrN is an ABSOLUTE WORD offset to a result-set PAGE BLOCK.
-    Actual result count = number of nonzero entries after fun12.
-5.  Each result-set page block (200B = 50 i32) layout:
-        [2]  ptrHED     (= 40, NOT numdof)
-        [11] ptrNSL     (relative to block base — nodal solution offset)
-        [12] ptrESL     (relative — element solution index)
-        [20] ptrOST     (relative = 3, always)
-    Sub-records at (base + relative_ptr) are accessed directly.
-6.  OST sub-record at (base+3): Fortran record, 10 i32 = 40B
-        [0]  nDOF_total (total interface DOFs = 321 in this model)
-        [2]  loadstep
-        [3]  substep
-        [4]  cumit
-        [8]  ptrNSL_rel (relative to base)  ← same as result page header [11]
-        [9]  ptrESL_rel (relative to base)
-7.  NSL data block at (base + ptrNSL_rel):
-        Fortran record: length = N_bytes (N = nDOF_total / numdof_per_node × 3 × 8 + 4)
-        Payload: [4B zero-pad] [f64 × n_nodes × 3]
-        Actual data starts at payload byte 4.
-        n_nodes × 3 = (N - 4) // 8
-        Node ordering = first group of node IDs from the main page block (offset 166).
-8.  ESL at (base + ptrESL_rel): [fun12:i32] [(lo,hi) pairs of element result ptrs...]
-    lo+hi×2^32 = absolute word offset to per-element result block.
-9.  Node equivalence table: stored inside the main page block (record 1).
-    At i32 offset 165 from page payload: fun12 sentinel, then 80 node IDs
-    (in result order, matching the rows of the NSL displacement array).
-10. CMS files (CMSflg≠0) do NOT store physical node XYZ coordinates.
-    The displacement values are interface-DOF amplitudes.
+The heavy Cython extensions in ansys-mapdl-reader are small (~2 MB) and
+pip-installable without ANSYS; they handle the low-level binary I/O.
+This module wraps them in a clean, minimal API.
 
-Dependencies: numpy only.
+Ground-truth format notes
+--------------------------
+* Standard header  : 100 raw i32 at byte 0 (no Fortran wrapper).
+* Result header    : Fortran record at word 103 (byte 412) → 80 i32.
+                     Key fields (0-based, fun12 is index 0):
+                       [2] nnod, [6] nelm, [8] nsets, [9] numdof
+                       [10] ptrDSIl, [11] ptrTIMl, [12] ptrLSPl
+                       [13] ptrELMl, [14] ptrNODl, [15] ptrGEOl
+* Geometry header  : Fortran record at ptrGEOl → geometry_header_keys.
+                     ptrLOCl → per-node coord records (via load_nodes).
+                     ptrEIDl → element connectivity (via load_elements).
+* Dataset index    : Fortran record at ptrDSIl → [resmax lo-words][resmax hi-words]
+                     → combine into nsets × int64 result-set base pointers.
+* Time values      : Fortran record at ptrTIMl → f64 array, first nsets entries.
+* Solution header  : Fortran record at rpointer[i] → solution_data_header_keys.
+                     Key fields: ptrNSL (disp), ptrESL (element results).
+* Nodal solution   : c_read_record(rp + ptrNSL) → int32 reinterpreted as f64.
+                     Shape: (nnod × numdof) column-major → reshape to (nnod, numdof).
+* Element results  : ESL record → 40 int64 ptrs (one per element).
+                     Each ptr → element index table (25 int32, one per result type).
+                     ENS_ptr[2], EEL_ptr[5], ETH_ptr[8] → Fortran record of float32
+                     corner values:  n_corners × ncomp  stored as f32.
+* Nodal averaging  : element corner f32 values averaged per node (sum / count).
+* Principal stress : computed from 3×3 symmetric tensor eigenvalues.
 """
 
-import struct
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from ansys.mapdl.reader._binary_reader import (
+    c_read_record, load_nodes, load_elements,
+)
+from ansys.mapdl.reader._rst_keys import (
+    result_header_keys, geometry_header_keys, solution_data_header_keys,
+)
+from ansys.mapdl.reader.common import parse_header
 
-# ---------------------------------------------------------------------------
-# Low-level helpers
-# ---------------------------------------------------------------------------
+# Element index table key positions (0-based)
+_EITK_ENS = 2   # nodal stress         6 f32/corner
+_EITK_EEL = 5   # elastic strain       7 f32/corner
+_EITK_EPL = 6   # plastic strain       7 f32/corner
+_EITK_ETH = 8   # thermal strain       8 f32/corner
 
-def _frec(data: bytes, byte_off: int) -> Tuple[int, bytes]:
-    """Read Fortran record at byte_off. Returns (n_bytes, payload)."""
-    if byte_off + 4 > len(data):
-        return 0, b""
-    n = struct.unpack("<I", data[byte_off:byte_off+4])[0]
-    if n == 0 or n > 20_000_000:
-        return 0, b""
-    end = byte_off + 4 + n
-    if end > len(data):
-        return 0, b""
-    return n, data[byte_off+4:end]
+_STRESS_COLS       = ["SX",  "SY",  "SZ",  "SXY", "SYZ", "SXZ"]
+_STRAIN_COLS       = ["EPELX","EPELY","EPELZ","EPELXY","EPELYZ","EPELXZ","EQV"]
+_PSTRAIN_COLS      = ["EPPLX","EPPLY","EPPLZ","EPPLXY","EPPLYZ","EPPLXZ","EQV"]
+_THSTRAIN_COLS     = ["EPTHX","EPTHY","EPTHZ","EPTHXY","EPTHYZ","EPTHXZ","EQV","ESWELL"]
+_PRINCIPAL_COLS    = ["S1",   "S2",   "S3",   "SINT", "SEQV"]
 
-
-def _i32(pay: bytes) -> np.ndarray:
-    n = (len(pay) // 4) * 4
-    return np.frombuffer(pay[:n], dtype=np.int32)
-
-
-def _f64(pay: bytes) -> np.ndarray:
-    n = (len(pay) // 8) * 8
-    return np.frombuffer(pay[:n], dtype=np.float64)
-
-
-# ---------------------------------------------------------------------------
-# RST Reader
-# ---------------------------------------------------------------------------
-
-RESULT_HEADER_KEYS = [
-    "fun12", "maxn", "numdof", "maxe", "nsets", "ptrEND", "ptrHED", "ptrNOD",
-    "ptrELM", "ptrDSI", "ptrTIM", "ptrLSP", "ptrELM2", "ptrGEO", "ptrCYC",
-    "CMSflg", "csEls", "units", "nSector", "csCord",
-]
+DOF_LABELS = {1:"UX",2:"UY",3:"UZ",4:"ROTX",5:"ROTY",6:"ROTZ",
+              7:"AX",8:"AY",9:"AZ",16:"TEMP",17:"PRES",18:"VOLT"}
 
 
 class RSTReader:
     """
-    Lightweight ANSYS RST file reader.
+    Lightweight ANSYS RST result file reader.
 
     Parameters
     ----------
     filename : str | Path
 
-    Attributes
-    ----------
-    n_nodes      : int   – nodes with displacement results
-    n_elements   : int   – element count
-    n_results    : int   – actual result sets stored
-    is_cms       : bool  – True for CMS superelement files
-    node_nums    : ndarray[int32] – ANSYS node numbers (result order)
-    ls_table     : list[dict]  – [{loadstep, substep, cumit}, ...]
-    time_values  : list[float] – time/load value per result set
+    Attributes (populated at construction)
+    ----------------------------------------
+    n_nodes      : int
+    n_elements   : int
+    n_results    : int
+    numdof       : int   DOF per node
+    node_nums    : int32 array (nnod,)   — ANSYS node numbers in result order
+    nnum_sorted  : int32 array (nnod,)   — ANSYS node numbers sorted ascending
+    nodes        : float64 (nnod,3)      — XYZ sorted by nnum_sorted
+    elem         : list[int32]           — element connectivity (one array per elem)
+    enum         : int32 (nelm,)         — ANSYS element numbers
+    time_values  : float64 (nsets,)
+    ls_table     : int32  (nsets,3)      — [loadstep, substep, cumit]
     """
 
     def __init__(self, filename):
         self._path = str(filename)
-        with open(self._path, "rb") as f:
-            self._data: bytes = f.read()
-
         self._parse()
 
     # ------------------------------------------------------------------
@@ -129,314 +93,288 @@ class RSTReader:
     # ------------------------------------------------------------------
 
     def _parse(self):
-        data = self._data
+        p = self._path
 
-        # ── 1. Standard header ──────────────────────────────────────────
-        n0, _p0 = _frec(data, 0)
-        std_end_byte = 4 + n0 + 4   # byte position after std header record
+        # ── Result header ────────────────────────────────────────────
+        rh_raw = c_read_record(p, 103, False)
+        rh     = parse_header(rh_raw, result_header_keys)
+        self._rh = rh
 
-        # ── 2. Page block (record 1) ─────────────────────────────────────
-        n1, p1 = _frec(data, std_end_byte)
-        if n1 == 0:
-            raise ValueError("Cannot read page block after standard header")
-        page_i32 = _i32(p1)
+        self.n_nodes   = int(rh['nnod'])
+        self.n_elements= int(rh['nelm'])
+        self.numdof    = int(rh['numdof'])
+        self.n_results = int(rh['nsets'])
+        resmax         = int(rh['resmax'])
 
-        # Result header at i32 offset 76 within the page payload
-        rh_raw = page_i32[76:76+20]
-        if rh_raw.size < 20:
-            raise ValueError("Page block too small — unexpected RST layout")
-        self._rh: Dict[str, int] = {
-            k: int(rh_raw[i]) for i, k in enumerate(RESULT_HEADER_KEYS)
-        }
+        # ── Geometry header ──────────────────────────────────────────
+        gh_raw = c_read_record(p, rh['ptrGEOl'], False)
+        gh     = parse_header(gh_raw, geometry_header_keys)
+        self._gh = gh
 
-        # ── 3. CMS flag ──────────────────────────────────────────────────
-        self.is_cms: bool = bool(self._rh.get("CMSflg", 0))
+        # ── Node coordinates (load_nodes fills nnum + xyz in one pass) ─
+        _nnum  = np.empty(self.n_nodes, np.int32)
+        _nodes = np.empty((self.n_nodes, 6), np.float64)
+        load_nodes(p, gh['ptrLOCl'], self.n_nodes, _nodes, _nnum)
+        sidx = np.argsort(_nnum)
+        self.nnum_sorted = _nnum[sidx].copy()
+        self.nodes       = _nodes[sidx, :3].copy()   # XYZ only
 
-        # ── 4. Dataset index → result-set base pointers ──────────────────
-        ptrLSP = self._rh["ptrLSP"]
-        n_lsp, p_lsp = _frec(data, ptrLSP * 4)
-        al = _i32(p_lsp)
-        # Layout: [fun12, ptr0, ptr1, ..., 0, 0, ...]
-        # Count non-zero entries after the fun12 sentinel
-        raw_ptrs = al[1:]
-        n_actual = int(np.argmax(raw_ptrs == 0))
-        if n_actual == 0 and raw_ptrs.size > 0 and raw_ptrs[0] != 0:
-            n_actual = int(np.sum(raw_ptrs != 0))
-        self._result_ptrs: np.ndarray = raw_ptrs[:n_actual].astype(np.int64)
+        # node_nums: result-order node IDs (for NSL/ESL alignment)
+        self.node_nums = c_read_record(p, rh['ptrNODl'], False).copy()
+        # map node_id → index in node_nums (result order)
+        self._nidx = {int(n): i for i, n in enumerate(self.node_nums)}
 
-        # ── 5. Node equivalence table (from main page block) ─────────────
-        # At page payload i32 offset 165: fun12 sentinel, then node IDs in
-        # result order (matching NSL displacement rows).
-        self._node_nums: np.ndarray = self._extract_node_nums(page_i32)
+        # ── Element connectivity ─────────────────────────────────────
+        ptr_eid   = gh['ptrEIDl']
+        e_disp    = c_read_record(p, ptr_eid, False).view(np.int64).copy()
+        flat, off = load_elements(p, ptr_eid, self.n_elements, e_disp)
+        self._flat_cells = flat
+        self._offsets    = off
+        self.elem  = [flat[off[i]: off[i+1] if i+1 < len(off) else len(flat)]
+                      for i in range(self.n_elements)]
+        self.enum  = np.array([e[8] for e in self.elem], np.int32)
 
-        # ── 6. Load-step / time table (from OST sub-records) ─────────────
-        self.ls_table:    List[Dict]  = []
-        self.time_values: List[float] = []
-        for base in self._result_ptrs:
-            ost = self._read_ost(int(base))
-            self.ls_table.append({
-                "loadstep": ost["loadstep"],
-                "substep":  ost["substep"],
-                "cumit":    ost["cumit"],
-            })
-            self.time_values.append(ost["time"])
+        # ── Dataset index → result-set base word pointers (int64) ───
+        dsi_raw = c_read_record(p, rh['ptrDSIl'], False)
+        lo  = dsi_raw[:resmax].tobytes()
+        hi  = dsi_raw[resmax:].tobytes()
+        combined = b"".join(lo[i*4:(i+1)*4] + hi[i*4:(i+1)*4]
+                            for i in range(self.n_results))
+        self._rpointers = np.frombuffer(combined, np.int64).copy()
 
-    def _extract_node_nums(self, page_i32: np.ndarray) -> np.ndarray:
-        """
-        Extract node numbers from the main page block.
+        # ── Time values ──────────────────────────────────────────────
+        tv_raw      = c_read_record(p, rh['ptrTIMl'], False)
+        self.time_values = tv_raw[:self.n_results].view(np.float64).copy()
 
-        Structure (discovered from binary analysis):
-          page_i32[157] = 80   (number of nodes with results)
-          page_i32[158] = 3    (number of DOF groups)
-          page_i32[159] = fun12  ← small group (3 entries: 1,2,3)
-          page_i32[163] = 321  (nDOF_total)
-          page_i32[164] = 3    (group count)
-          page_i32[165] = fun12  ← main node list follows
-          page_i32[166:166+n_nodes] = node IDs in result order
-        """
-        sentinel = np.int32(-2147483648)
-
-        # Read n_nodes from page_i32[157] — verified from binary
-        n_nodes_candidate = int(page_i32[157]) if page_i32.size > 157 else 0
-
-        # Find the main node list: second fun12 at offset 165
-        main_list_start = 166
-        if page_i32.size > main_list_start + n_nodes_candidate:
-            ids = page_i32[main_list_start : main_list_start + n_nodes_candidate]
-            # Validate: all should be positive integers (node IDs)
-            if np.all(ids > 0) and np.all(ids < 1_000_000):
-                return ids.astype(np.int32)
-
-        # Fallback: scan for fun12 followed by a clean run of valid node IDs
-        for i in range(100, min(300, page_i32.size)):
-            if page_i32[i] == sentinel:
-                run = []
-                for j in range(i+1, min(i+400, page_i32.size)):
-                    v = int(page_i32[j])
-                    if 1 <= v < 1_000_000:
-                        run.append(v)
-                    else:
-                        break
-                if len(run) >= 10:
-                    return np.array(run, dtype=np.int32)
-
-        return np.arange(1, n_nodes_candidate+1, dtype=np.int32)
-
-    def _read_ost(self, base: int) -> dict:
-        """
-        Read OST sub-record at (base+3).
-        Returns dict: numnod, loadstep, substep, cumit, time, ptrNSL, ptrESL.
-        """
-        n, p = _frec(self._data, (base + 3) * 4)
-        ao = _i32(p)
-        if ao.size < 10:
-            return dict(numnod=0, loadstep=0, substep=0, cumit=0,
-                        time=0.0, ptrNSL=0, ptrESL=0)
-        loadstep = int(ao[2])
-        substep  = int(ao[3])
-        cumit    = int(ao[4])
-        ptrNSL   = int(ao[8])
-        ptrESL   = int(ao[9])
-        # Time value: fallback to substep; a real time f64 is not reliably stored
-        time_val = float(substep)
-        return dict(numnod=int(ao[0]), loadstep=loadstep, substep=substep,
-                    cumit=cumit, time=time_val, ptrNSL=ptrNSL, ptrESL=ptrESL)
+        # ── Load-step table [nsets × 3] ──────────────────────────────
+        ls_raw = c_read_record(p, rh['ptrLSPl'], False)
+        self.ls_table = ls_raw[:self.n_results * 3].reshape(-1, 3).copy()
 
     # ------------------------------------------------------------------
-    # Public properties
+    # Solution header (cached per result)
     # ------------------------------------------------------------------
 
-    @property
-    def n_nodes(self) -> int:
-        return len(self._node_nums)
+    def _sh(self, rnum: int) -> dict:
+        rp  = int(self._rpointers[rnum])
+        raw = c_read_record(self._path, rp, False)
+        return parse_header(raw, solution_data_header_keys)
 
-    @property
-    def n_elements(self) -> int:
-        return self._rh.get("maxe", 0)
-
-    @property
-    def n_results(self) -> int:
-        return len(self._result_ptrs)
-
-    @property
-    def node_nums(self) -> np.ndarray:
-        return self._node_nums
+    def _esl_ptrs(self, sh: dict, rp: int) -> Tuple[int, np.ndarray]:
+        """Return (esl_base_word, int64 array of per-element ptrs)."""
+        esl_base = rp + sh['ptrESL']
+        raw      = c_read_record(self._path, esl_base, False)
+        return esl_base, raw.view(np.int64).copy()
 
     # ------------------------------------------------------------------
-    # Result reading
+    # Nodal displacement
     # ------------------------------------------------------------------
 
     def nodal_solution(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Read nodal DOF solution for result index rnum (0-based).
+        Read nodal DOF solution.
 
         Returns
         -------
-        node_nums : ndarray[int32], shape (n_nodes,)
-        result    : ndarray[float64], shape (n_nodes, 3)
-            Columns: UX, UY, UZ  (or ROTX/ROTY/ROTZ for rotational DOF,
-            depending on model configuration).
+        node_nums : int32  (n_nodes,)   ANSYS node numbers in result order
+        disp      : float64 (n_nodes, numdof)
         """
-        if rnum < 0 or rnum >= self.n_results:
-            raise IndexError(
-                f"Result index {rnum} out of range [0, {self.n_results})")
+        self._check(rnum)
+        rp  = int(self._rpointers[rnum])
+        sh  = self._sh(rnum)
+        raw = c_read_record(self._path, rp + sh['ptrNSL'], False)
+        n   = self.n_nodes * self.numdof
+        disp = np.frombuffer(raw.tobytes()[:n * 8], np.float64).reshape(
+            self.n_nodes, self.numdof).copy()
+        return self.node_nums, disp
 
-        base   = int(self._result_ptrs[rnum])
-        ost    = self._read_ost(base)
-        ptrNSL = ost["ptrNSL"]
-
-        if ptrNSL == 0:
-            empty = np.zeros((0, 3), dtype=np.float64)
-            return self._node_nums[:0], empty
-
-        # NSL Fortran record: [4B N_bytes] [4B zero-pad] [f64 × n_nodes × 3]
-        n_nsl, p_nsl = _frec(self._data, (base + ptrNSL) * 4)
-        if n_nsl == 0 or len(p_nsl) < 12:
-            empty = np.zeros((0, 3), dtype=np.float64)
-            return self._node_nums[:0], empty
-
-        # Skip 4-byte zero pad at start of payload
-        raw = p_nsl[4:]
-        n_f64 = len(raw) // 8
-        disp_flat = np.frombuffer(raw[:n_f64*8], dtype=np.float64).copy()
-        n_nodes_in_block = n_f64 // 3
-
-        disp = disp_flat[:n_nodes_in_block * 3].reshape(n_nodes_in_block, 3)
-        nnum = self._node_nums[:n_nodes_in_block]
-        return nnum, disp
-
-    def nodal_solution_all(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Read all result sets' nodal DOF solutions.
-
-        Returns
-        -------
-        node_nums : ndarray[int32], shape (n_nodes,)
-        results   : ndarray[float64], shape (n_results, n_nodes, 3)
-        """
-        all_res = []
-        nnum = None
-        for i in range(self.n_results):
-            nn, res = self.nodal_solution(i)
-            if nnum is None:
-                nnum = nn
-            all_res.append(res)
-        if not all_res:
-            return np.array([], np.int32), np.zeros((0, 0, 3))
-        return nnum, np.stack(all_res, axis=0)
-
-    def displacement_magnitude(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute displacement magnitude (√(UX²+UY²+UZ²)) for each node.
-
-        Returns
-        -------
-        node_nums : ndarray[int32]
-        magnitude : ndarray[float64]
-        """
-        nnum, disp = self.nodal_solution(rnum)
-        mag = np.sqrt((disp**2).sum(axis=1))
-        return nnum, mag
-
-    def principal_stress(self, stress: np.ndarray) -> np.ndarray:
-        """
-        Compute principal stresses from (N,6) [SX SY SZ SXY SYZ SXZ].
-        Returns (N,5) [S1 S2 S3 SINT SEQV].
-        """
-        n = stress.shape[0]
-        out = np.zeros((n, 5), dtype=np.float64)
-        for i in range(n):
-            sx, sy, sz, sxy, syz, sxz = stress[i]
-            m = np.array([[sx, sxy, sxz],
-                          [sxy, sy, syz],
-                          [sxz, syz, sz]])
-            eigs = np.sort(np.linalg.eigvalsh(m))[::-1]
-            s1, s2, s3 = eigs
-            out[i] = [s1, s2, s3, s1 - s3,
-                      np.sqrt(0.5 * ((s1-s2)**2 + (s2-s3)**2 + (s3-s1)**2))]
-        return out
+    def nodal_displacement(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Alias for nodal_solution (matches mapdl-reader API)."""
+        return self.nodal_solution(rnum)
 
     # ------------------------------------------------------------------
-    # Utility
+    # Element-nodal results (stress, strain, …)
+    # ------------------------------------------------------------------
+
+    def _read_elem_nodal(self, rnum: int, key_idx: int,
+                         ncomp: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Average element corner float32 results to nodes.
+
+        Parameters
+        ----------
+        key_idx : int  position in element index table (e.g. 2=ENS, 5=EEL)
+        ncomp   : int  components per corner (6 for stress, 7 for strain, …)
+
+        Returns
+        -------
+        node_nums : int32  (n_nodes,)   ANSYS node numbers (sorted)
+        result    : float64 (n_nodes, ncomp)  NaN where element results absent
+        """
+        self._check(rnum)
+        rp  = int(self._rpointers[rnum])
+        sh  = self._sh(rnum)
+        esl_base, esl_ptrs = self._esl_ptrs(sh, rp)
+
+        s   = np.zeros((self.n_nodes, ncomp), np.float64)
+        cnt = np.zeros(self.n_nodes, np.int32)
+
+        for e in range(self.n_elements):
+            eb  = esl_base + int(esl_ptrs[e])
+            eit = c_read_record(self._path, eb, False)
+            if eit.size <= key_idx or eit[key_idx] == 0:
+                continue
+            raw  = c_read_record(self._path, eb + int(eit[key_idx]), False)
+            f32  = raw.view(np.float32)
+            ncor = f32.size // ncomp
+            if ncor == 0:
+                continue
+            mat  = f32[:ncor * ncomp].reshape(ncor, ncomp).astype(np.float64)
+            nids = self.elem[e][10: 10 + ncor]
+            for j, nid in enumerate(nids):
+                nid = int(nid)
+                if nid in self._nidx:
+                    i = self._nidx[nid]
+                    s[i]   += mat[j]
+                    cnt[i] += 1
+
+        arr          = np.full((self.n_nodes, ncomp), np.nan, np.float64)
+        mask         = cnt > 0
+        arr[mask]    = s[mask] / cnt[mask, None]
+
+        # Return sorted by node number (matches mapdl-reader output)
+        sidx = np.argsort(self.node_nums)
+        return self.node_nums[sidx], arr[sidx]
+
+    def nodal_stress(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Nodal averaged stress. Returns (nnum, (n,6) [SX SY SZ SXY SYZ SXZ])."""
+        return self._read_elem_nodal(rnum, _EITK_ENS, 6)
+
+    def nodal_elastic_strain(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Nodal averaged elastic strain. Returns (nnum, (n,7))."""
+        return self._read_elem_nodal(rnum, _EITK_EEL, 7)
+
+    def nodal_plastic_strain(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Nodal averaged plastic strain (7 components)."""
+        return self._read_elem_nodal(rnum, _EITK_EPL, 7)
+
+    def nodal_thermal_strain(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Nodal averaged thermal strain (8 components)."""
+        return self._read_elem_nodal(rnum, _EITK_ETH, 8)
+
+    # ------------------------------------------------------------------
+    # Principal stress
+    # ------------------------------------------------------------------
+
+    def principal_nodal_stress(self, rnum: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Principal stresses computed from nodal_stress.
+
+        Returns
+        -------
+        nnum   : int32  (n_nodes,)
+        result : float64 (n_nodes, 5)  [S1 S2 S3 SINT SEQV]
+        """
+        nnum, stress = self.nodal_stress(rnum)
+        n   = stress.shape[0]
+        out = np.full((n, 5), np.nan, np.float64)
+        for i in range(n):
+            if np.any(np.isnan(stress[i])):
+                continue
+            sx, sy, sz, sxy, syz, sxz = stress[i]
+            m = np.array([[sx, sxy, sxz],
+                          [sxy, sy,  syz],
+                          [sxz, syz, sz ]])
+            e1, e2, e3 = np.sort(np.linalg.eigvalsh(m))[::-1]
+            out[i] = [e1, e2, e3, e1 - e3,
+                      np.sqrt(0.5 * ((e1-e2)**2 + (e2-e3)**2 + (e3-e1)**2))]
+        return nnum, out
+
+    # ------------------------------------------------------------------
+    # Solution info / metadata
+    # ------------------------------------------------------------------
+
+    def solution_info(self, rnum: int) -> dict:
+        """Return metadata dict for result set rnum."""
+        self._check(rnum)
+        ls = self.ls_table[rnum]
+        sh = self._sh(rnum)
+        return {
+            "loadstep":  int(ls[0]),
+            "substep":   int(ls[1]),
+            "cumit":     int(ls[2]),
+            "time":      float(self.time_values[rnum]),
+            "numdof":    self.numdof,
+            "n_nodes":   self.n_nodes,
+            "n_elements":self.n_elements,
+        }
+
+    def dof_labels(self, rnum: int = 0) -> List[str]:
+        """Return DOF label list for result rnum (e.g. ['UX','UY','UZ'])."""
+        sh = self._sh(rnum)
+        dofs = sh.get('DOFS', [])
+        if dofs:
+            return [DOF_LABELS.get(int(d), f"DOF{d}") for d in dofs]
+        return [DOF_LABELS.get(i + 1, f"DOF{i+1}") for i in range(self.numdof)]
+
+    # ------------------------------------------------------------------
+    # Summary
     # ------------------------------------------------------------------
 
     def summary(self) -> str:
         lines = [
-            f"RST File    : {self._path}",
-            f"File size   : {len(self._data):,} bytes",
-            f"CMS file    : {self.is_cms}",
-            f"Nodes       : {self.n_nodes}",
-            f"Elements    : {self.n_elements}",
-            f"Results     : {self.n_results}",
-            f"CMSflg      : {self._rh.get('CMSflg', 0)}",
-            f"ptrLSP      : {self._rh.get('ptrLSP', 0)}",
-            f"ptrGEO      : {self._rh.get('ptrGEO', 0)}",
+            f"RST File   : {self._path}",
+            f"Nodes      : {self.n_nodes}",
+            f"Elements   : {self.n_elements}",
+            f"DOF/node   : {self.numdof}  ({', '.join(self.dof_labels())})",
+            f"Results    : {self.n_results}",
             "",
-            "  # |  LS |  SS | cumit | time ",
-            "----+-----+-----+-------+------",
+            "  # | LS | SS | cumit |      time",
+            "----+----+----+-------+----------",
         ]
-        for i, ls in enumerate(self.ls_table):
-            t = self.time_values[i]
-            lines.append(
-                f"{i:3d} | {ls['loadstep']:3d} | {ls['substep']:3d} "
-                f"| {ls['cumit']:5d} | {t:.4g}"
-            )
+        for i, (ls, t) in enumerate(zip(self.ls_table, self.time_values)):
+            lines.append(f"{i:3d} |{int(ls[0]):3d} |{int(ls[1]):3d} "
+                         f"|{int(ls[2]):6d} | {float(t):.6g}")
         return "\n".join(lines)
 
-    def close(self):
-        # Data is held in memory; nothing to close.
-        pass
+    # ------------------------------------------------------------------
+    # Context manager / helpers
+    # ------------------------------------------------------------------
 
-    def __enter__(self):
-        return self
+    def _check(self, rnum: int):
+        if not (0 <= rnum < self.n_results):
+            raise IndexError(
+                f"Result index {rnum} out of range [0, {self.n_results})")
 
-    def __exit__(self, *_):
-        self.close()
-
+    def close(self): pass
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
     def __repr__(self):
-        return (
-            f"RSTReader('{Path(self._path).name}', "
-            f"nodes={self.n_nodes}, elements={self.n_elements}, "
-            f"results={self.n_results}, cms={self.is_cms})"
-        )
+        return (f"RSTReader('{Path(self._path).name}', "
+                f"nodes={self.n_nodes}, elements={self.n_elements}, "
+                f"results={self.n_results})")
 
-
-# ---------------------------------------------------------------------------
-# Top-level convenience
-# ---------------------------------------------------------------------------
 
 def read_rst(filename) -> RSTReader:
     """Open an ANSYS RST file and return an RSTReader."""
     return RSTReader(filename)
 
 
-# ---------------------------------------------------------------------------
-# CLI smoke-test:  python rst_reader.py  file.rst
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-
     path = sys.argv[1] if len(sys.argv) > 1 else "file.rst"
     with read_rst(path) as rst:
         print(rst)
         print()
         print(rst.summary())
         print()
-
-        for rnum in range(rst.n_results):
-            nnum, disp = rst.nodal_solution(rnum)
-            _, mag = rst.displacement_magnitude(rnum)
-            ls = rst.ls_table[rnum]
-            print(f"Result {rnum:2d}  LS={ls['loadstep']} SS={ls['substep']:2d}  "
-                  f"nodes={len(nnum)}  max|U|={mag.max():.4f}")
-
+        for rn in range(rst.n_results):
+            nn, d = rst.nodal_solution(rn)
+            ls    = rst.ls_table[rn]
+            print(f"  Result {rn:2d}  LS={ls[0]} SS={ls[1]:2d}  "
+                  f"max|U|={np.sqrt((d**2).sum(1)).max():.4f}")
         print()
-        nnum_all, all_disp = rst.nodal_solution_all()
-        print(f"All results array: {all_disp.shape}  "
-              f"(n_results × n_nodes × 3_dof)")
-        print()
-        print("Node mapping (first 10 nodes, result 0):")
-        nnum0, d0 = rst.nodal_solution(0)
-        for i in range(min(10, len(nnum0))):
-            print(f"  Node {nnum0[i]:4d}:  "
-                  f"UX={d0[i,0]:10.4f}  UY={d0[i,1]:10.4f}  UZ={d0[i,2]:10.4f}")
+        nn, s = rst.nodal_stress(1)
+        ps    = rst.principal_nodal_stress(1)
+        print(f"Stress result 1:")
+        print(f"  Node {nn[0]}: SX={s[0,0]:.4g}  SY={s[0,1]:.4g}  SZ={s[0,2]:.4g}")
+        print(f"  Node {nn[0]}: S1={ps[1][0,0]:.4g}  SEQV={ps[1][0,4]:.4g}")
